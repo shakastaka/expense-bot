@@ -28,7 +28,7 @@ RULES = {'продукты': ('spar', 'lidl', 'hofer', 'mercator', 'tuš', 'tus'
 CURRENCY_SYMBOLS = {'€': 'EUR', '$': 'USD', '£': 'GBP', '₽': 'RUB', '₾': 'GEL'}
 CURRENCY_MARK = r'(?:[A-Za-z]{3}|[€$£₽₾])'
 LOCAL_TZ = ZoneInfo('Europe/Ljubljana')
-VERSION = '2026-10-07.3'
+VERSION = '2026-10-09.1'
 CURRENT_USER = ContextVar('telegram_user_id', default=None)
 
 def owner():
@@ -207,6 +207,10 @@ def parse_user_date(value):
 
 @contextmanager
 def conn():
+    if os.getenv("DATABASE_URL"):
+        from database import connection
+        with connection() as c: yield c
+        return
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
     c.execute('PRAGMA foreign_keys=ON')
@@ -217,6 +221,10 @@ def conn():
         c.close()
 
 def init():
+    if os.getenv("DATABASE_URL"):
+        from database import initialize
+        initialize()
+        return
     # A backup is made before the only schema change. Existing rows belong to the old allowed ID.
     legacy_owner = os.getenv('ALLOWED_TELEGRAM_ID', '').strip()
     with conn() as c:
@@ -1557,10 +1565,12 @@ async def setup_commands(app):
         BotCommand('triplink','Привязать расход к поездке'),
     ])
 
-def main():
+def build_application(webhook=False):
     if not os.getenv('TELEGRAM_BOT_TOKEN'): raise SystemExit('Set TELEGRAM_BOT_TOKEN in .env')
     init()
-    app=Application.builder().token(os.environ['TELEGRAM_BOT_TOKEN']).post_init(setup_commands).build()
+    builder=Application.builder().token(os.environ['TELEGRAM_BOT_TOKEN']).post_init(setup_commands)
+    if webhook: builder=builder.updater(None)
+    app=builder.build()
     for name,fn in [('start',start),('help',help_cmd),('add',add),('currency',currency_cmd),('cancel',cancel_cmd),('categories',categories),('budget',budget),('budgets',budgets_cmd),('report',report),('history',history),('operations',operations),('correct',correct),('rule',rule),('rules',rules),('export',export_csv),('delete',delete),('import',import_cmd),('income',income_cmd),('income_report',income_report),('incomecat',incomecat),('goals',goals_cmd),('goalnew',goalnew),('goaladd',goaladd),('balance',balance_cmd),('opening',opening_cmd),('trips',trips_cmd),('tripnew',tripnew),('tripadd',tripadd),('tripreport',tripreport),('tripbudget',tripbudget),('triplink',triplink)]: app.add_handler(CommandHandler(name,fn))
     app.add_handler(CallbackQueryHandler(operation_button,pattern=r'^(fixpick|fixset|delpick|delconfirm|cancel)(:|$)'))
     app.add_handler(CallbackQueryHandler(history_button,pattern=r'^(histpage|histmonths|histitem):'))
@@ -1576,6 +1586,10 @@ def main():
     app.add_handler(CallbackQueryHandler(trip_button,pattern=r'^trip:(new|list|view|select|add|category|budget|export):'))
     app.add_handler(MessageHandler(filters.Document.ALL,import_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,cash))
+    return app
+
+def main():
+    app=build_application()
     app.run_polling()
 
 if __name__=='__main__': main()
