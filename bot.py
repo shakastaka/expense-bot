@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
+from money import parse_money, normalize_currency
 from bank_import import parse_statement
 from extra_statements import parse_extra_statement
 from dotenv import load_dotenv
@@ -25,10 +26,8 @@ CATEGORIES = ('продукты', 'кафе', 'транспорт', 'жильё'
 INCOME_CATEGORIES = ('зарплата', 'подработка', 'подарки', 'возврат', 'проценты', 'другое')
 TRIP_CATEGORIES = ('дорога', 'жильё', 'еда', 'транспорт', 'развлечения', 'покупки', 'другое')
 RULES = {'продукты': ('spar', 'lidl', 'hofer', 'mercator', 'tuš', 'tus', 'магазин'), 'кафе': ('coffee', 'cafe', 'кофе', 'ресторан', 'restavracija'), 'транспорт': ('petrol', 'uber', 'bolt', 'такси', 'bus'), 'подписки': ('netflix', 'spotify', 'youtube premium'), 'жильё': ('rent', 'аренда'), 'здоровье': ('pharmacy', 'аптека', 'lekarna')}
-CURRENCY_SYMBOLS = {'€': 'EUR', '$': 'USD', '£': 'GBP', '₽': 'RUB', '₾': 'GEL'}
-CURRENCY_MARK = r'(?:[A-Za-z]{3}|[€$£₽₾])'
 LOCAL_TZ = ZoneInfo('Europe/Ljubljana')
-VERSION = '2026-10-09.1'
+VERSION = '2026-10-09.2'
 CURRENT_USER = ContextVar('telegram_user_id', default=None)
 
 def owner():
@@ -44,35 +43,10 @@ def today():
     return datetime.now(LOCAL_TZ).date()
 
 def parse_entry(value, default_currency='EUR'):
-    # A friendly spoken example: «два с половиной евро кофе».
-    spoken = re.fullmatch(r'\s*(два|две|три|четыре|пять|один|одна|полтора)(?:\s+с\s+половиной)?\s+(евро|доллар(?:а|ов)?|руб(?:ль|ля|лей)|фунт(?:а|ов)?|лари)\s+(.{2,120})\s*', value.casefold())
-    if spoken:
-        amount = NUMBER_WORDS[spoken.group(1)] + (0.5 if ' с половиной ' in value.casefold() else 0)
-        value = f'{str(amount).replace(".", ",")} {CURRENCY_WORDS[spoken.group(2)]} {spoken.group(3)}'
-    m = re.fullmatch(
-        rf'\s*([+-]?)\s*({CURRENCY_MARK})?\s*(\d+(?:[.,]\d{{1,2}})?)\s*({CURRENCY_MARK})?\s+(.{{2,120}})\s*',
-        value,
-    )
-    if not m:
-        tail = re.fullmatch(
-            rf'\s*(.{{2,120}}?)\s+([+-]?)\s*({CURRENCY_MARK})?\s*(\d+(?:[.,]\d{{1,2}})?)\s*({CURRENCY_MARK})?\s*',
-            value,
-        )
-        if tail:
-            # Put the amount first, then apply the same parsing rules.
-            value = f"{tail.group(2)}{tail.group(3) or ''}{tail.group(4)}{tail.group(5) or ''} {tail.group(1)}"
-            m = re.fullmatch(
-                rf'\s*([+-]?)\s*({CURRENCY_MARK})?\s*(\d+(?:[.,]\d{{1,2}})?)\s*({CURRENCY_MARK})?\s+(.{{2,120}})\s*',
-                value,
-            )
-    if not m or (m.group(2) and m.group(4)):
-        return None
-    marker = m.group(2) or m.group(4) or default_currency
-    currency = CURRENCY_SYMBOLS.get(marker, marker.upper())
-    cents = int(Decimal(m.group(3).replace(',', '.')) * 100)
-    if cents <= 0:
-        return None
-    return (cents if m.group(1) == '+' else -cents, currency, m.group(5).strip())
+    parsed = parse_money(value, default_currency)
+    if not parsed: return None
+    cents, currency, description = parsed
+    return cents, currency, description or 'другое'
 
 def parse_date_prefix(value):
     value = value.strip()
@@ -138,19 +112,11 @@ async def balance_cmd(u,ctx):
 
 async def opening_cmd(u,ctx):
     if not await guard(u):return
-    args=ctx.args
-    if len(args) not in (1,2):
-        await u.message.reply_text('Начальная сумма: /opening 500 EUR. Это уже имевшиеся деньги до записей в боте; команда заменяет начальную сумму, а не добавляет доход.');return
-    currency=args[1].upper() if len(args)==2 else (default_currency() or 'EUR')
-    if not re.fullmatch('[A-Z]{3}',currency):
-        await u.message.reply_text('Код валюты — три латинские буквы, например EUR.');return
-    try:
-        raw=Decimal(args[0].replace(',','.'))
-        if not raw.is_finite() or raw<0 or raw>1_000_000_000 or raw*100!=int(raw*100):raise ValueError()
-        cents=int(raw*100)
-    except (ValueError,InvalidOperation):
-        await u.message.reply_text('Укажи неотрицательную сумму с максимум двумя знаками после запятой.');return
-    with conn() as c:c.execute('INSERT OR REPLACE INTO user_settings(user_id,key,value) VALUES(?,?,?)',(owner(),'opening:'+currency,str(cents)))
+    parsed=parse_money(' '.join(ctx.args),default_currency() or 'EUR',allow_zero=True)
+    if not parsed or parsed[2] or ' '.join(ctx.args).lstrip().startswith('-'):
+        await u.message.reply_text('Начальная сумма: /opening 500, /opening 500€ или /opening 10000 RUB. Неотрицательная сумма. Заменяет начальную сумму выбранной валюты, а не добавляет доход.');return
+    cents,currency,_=parsed
+    with conn() as c:c.execute('INSERT OR REPLACE INTO user_settings(user_id,key,value) VALUES(?,?,?)',(owner(),'opening:'+currency,str(abs(cents))))
     await show_balance(u.message)
 
 def period(arg):
@@ -315,14 +281,14 @@ async def start(u, ctx):
 
 async def show_home(message):
     currency = default_currency() or 'EUR'
-    await message.reply_text(f'Учёт денег · версия {VERSION}\nВалюта по умолчанию: {currency}\n\nРасход: 2,50 кофе. Другая валюта: 3 USD такси.\nДоходы, накопления и поездки открываются кнопками ниже. /help — все команды.', reply_markup=home_keyboard())
+    await message.reply_text(f'Учёт денег · версия {VERSION}\nВалюта по умолчанию: {currency}\n\nРасход: 2,50 кофе или просто 20 — в валюте по умолчанию.\n20₽ или 20 RUB — разовый расход в рублях; валюта по умолчанию не меняется.\nДоход: /income 1500€ зарплата. /opening 500€ — деньги, имевшиеся до начала учёта.\n/balance — остатки по всем валютам.\nДоходы, накопления и поездки открываются кнопками ниже. /help — все команды.', reply_markup=home_keyboard())
 
 async def currency_cmd(u, ctx):
     if not await guard(u): return
     if ctx.args:
-        value = ctx.args[0].upper()
-        if not re.fullmatch('[A-Z]{3}', value):
-            await u.message.reply_text('Укажи три буквы: /currency EUR, /currency USD или /currency PLN.'); return
+        value = normalize_currency(ctx.args[0])
+        if not value:
+            await u.message.reply_text('Укажи валюту: /currency EUR, /currency € или /currency RUB.'); return
         set_default_currency(value)
         await u.message.reply_text(f'Валюта по умолчанию: {value}.')
         await show_home(u.message)
@@ -413,13 +379,13 @@ async def cash(u, ctx):
         await send_period_csv(u.message,start_day.isoformat(),chosen.isoformat(),expenses_only=False)
         return
     if ctx.user_data.pop('awaiting_currency', False):
-        code = raw.upper()
-        if re.fullmatch('[A-Z]{3}', code):
+        code = normalize_currency(raw)
+        if code:
             set_default_currency(code)
             await show_home(u.message)
         else:
             ctx.user_data['awaiting_currency'] = True
-            await u.message.reply_text('Напиши код из трёх латинских букв, например PLN.')
+            await u.message.reply_text('Напиши код или обозначение валюты: EUR, €, RUB, ₽, PLN.')
         return
     if ctx.user_data.get('awaiting_add_date'):
         parsed = parse_date_prefix(raw)
@@ -446,8 +412,8 @@ async def cash(u, ctx):
         return
     chosen = ctx.user_data.get('pending_category')
     entry = parse_entry(raw, default_currency() or 'EUR')
-    if not entry and chosen:
-        entry = parse_entry(raw + ' ' + chosen, default_currency() or 'EUR')
+    if chosen and entry and entry[2] == 'другое':
+        entry = (entry[0],entry[1],chosen)
     if not entry:
         await u.message.reply_text('Не распознал запись. Пример: 2,50 кофе, кофе 2,50 или 3 USD такси. /help')
         return
@@ -456,13 +422,17 @@ async def cash(u, ctx):
         entry = (abs(entry[0]), entry[1], entry[2])
     await save_entry(u, today(), *entry, selected_category=chosen)
 
+def balance_receipt(currency):
+    balance,reserved,available=balance_values(currency)
+    return f'Баланс {currency}: {balance/100:.2f} · в целях: {reserved/100:.2f} · доступно: {available/100:.2f}'
+
 async def save_entry(u, day, cents, currency, description, selected_category=None, income_category=None):
     cat = selected_category or category_for(description, cents)
     if cents > 0 and cat == 'доход': income_category = income_category or income_category_for(description)
     with conn() as c:
         cur = c.execute('INSERT INTO operations(user_id,source,day,amount_cents,currency,description,category,income_category) VALUES(?,?,?,?,?,?,?,?)', (owner(),'cash', day.isoformat(), cents, currency, description, cat,income_category))
     suffix=f' · {income_category}' if cents>0 and cat=='доход' else ''
-    await u.message.reply_text(f'Записано #{cur.lastrowid}: {day} · {cents/100:+.2f} {currency} · {cat}{suffix}\n/correct {cur.lastrowid} категория · /delete {cur.lastrowid}')
+    await u.message.reply_text(f'Записано #{cur.lastrowid}: {day} · {cents/100:+.2f} {currency} · {cat}{suffix}\n{balance_receipt(currency)}\n/correct {cur.lastrowid} категория · /delete {cur.lastrowid}')
 
 async def add(u, ctx):
     if not await guard(u): return
@@ -616,22 +586,16 @@ async def categories(u, ctx):
 
 async def budget(u, ctx):
     if not await guard(u): return
-    if len(ctx.args) not in (2,3) or ctx.args[0].lower() not in CATEGORIES or ctx.args[0].lower() in ('доход','переводы'):
-        await u.message.reply_text('Пример: /budget продукты 300 EUR. Для удаления: /budget продукты 0 EUR'); return
-    try:
-        amount = Decimal(ctx.args[1].replace(',','.'))
-        if not amount.is_finite() or amount < 0 or amount.as_tuple().exponent < -2: raise ValueError()
-        cents = int(amount * 100)
-    except (InvalidOperation,ValueError):
-        await u.message.reply_text('Сумма должна быть неотрицательной, не более двух знаков после запятой.'); return
-    marker = ctx.args[2] if len(ctx.args)==3 else 'EUR'
-    currency = CURRENCY_SYMBOLS.get(marker,marker.upper())
-    if not re.fullmatch('[A-Z]{3}',currency):
-        await u.message.reply_text('Валюта: EUR, USD, RUB и т. д.'); return
-    cat = ctx.args[0].lower()
+    if len(ctx.args)<2 or ctx.args[0].lower() not in CATEGORIES or ctx.args[0].lower() in ('доход','переводы'):
+        await u.message.reply_text('Пример: /budget продукты 300€ или /budget продукты 300. Ноль удаляет лимит.');return
+    text=' '.join(ctx.args[1:])
+    parsed=parse_money(text,default_currency() or 'EUR',allow_zero=True)
+    if not parsed or parsed[2] or text.lstrip().startswith('-'):
+        await u.message.reply_text('Укажи неотрицательную сумму и валюту: 300 EUR, 300€ или 300.');return
+    cents,currency,_=parsed;cents=abs(cents);cat=ctx.args[0].lower()
     with conn() as c:
-        if cents: c.execute('INSERT OR REPLACE INTO user_budgets VALUES (?,?,?,?)',(owner(),cat,currency,cents))
-        else: c.execute('DELETE FROM user_budgets WHERE user_id=? AND category=? AND currency=?',(owner(),cat,currency))
+        if cents:c.execute('INSERT OR REPLACE INTO user_budgets VALUES (?,?,?,?)',(owner(),cat,currency,cents))
+        else:c.execute('DELETE FROM user_budgets WHERE user_id=? AND category=? AND currency=?',(owner(),cat,currency))
     await u.message.reply_text(f'Лимит {cat}: {cents/100:.2f} {currency}' if cents else f'Лимит {cat} в {currency} удалён.')
 
 async def budgets_cmd(u, ctx):
@@ -1073,8 +1037,8 @@ async def income_cmd(u,ctx):
 
 async def save_income(u,raw,category):
     entry=parse_entry(raw,default_currency() or 'EUR')
-    if not entry and category:
-        entry=parse_entry(raw+' '+category,default_currency() or 'EUR')
+    if category and entry and entry[2]=='другое':
+        entry=(entry[0],entry[1],category)
     if not entry:
         await u.effective_message.reply_text('Напиши сумму и описание: 1500 EUR зарплата. /cancel — отменить.')
         return False
@@ -1203,18 +1167,12 @@ async def goals_cmd(u,ctx):
 
 
 async def create_goal(message,text):
-    m=re.fullmatch(r'\s*([€$£₽₾])?\s*([\d.,]+)\s*(?:([A-Za-z]{3}|[€$£₽₾]|евро)\s+|\s+)(.{2,60})\s*',text,re.I)
-    if not m:
-        await message.reply_text('Напиши сумму и название: 1000 путешествие, 1000 € путешествие или 1000 EUR путешествие.');return False
-    try: cents=positive_cents(m.group(2))
-    except (ValueError,InvalidOperation):
-        await message.reply_text('Укажи сумму больше нуля и максимум две цифры после запятой.');return False
-    marker=(m.group(1) or m.group(3) or default_currency() or 'EUR').upper()
-    currency='EUR' if marker=='ЕВРО' else CURRENCY_SYMBOLS.get(marker,marker)
-    if m.group(1) and m.group(3):
-        await message.reply_text('Укажи валюту один раз, например: 1000 € путешествие.');return False
+    parsed=parse_money(text,default_currency() or 'EUR')
+    if not parsed or not 2<=len(parsed[2])<=60 or text.lstrip().startswith('-'):
+        await message.reply_text('Напиши сумму и название: 1000 путешествие, 1000€ путешествие или 1000 EUR путешествие.');return False
+    cents,currency,name=parsed;cents=abs(cents)
     with conn() as c:
-        cur=c.execute('INSERT INTO savings_goals(user_id,name,currency,target_cents,created_day) VALUES(?,?,?,?,?)',(owner(),m.group(4).strip(),currency,cents,today().isoformat()))
+        cur=c.execute('INSERT INTO savings_goals(user_id,name,currency,target_cents,created_day) VALUES(?,?,?,?,?)',(owner(),name,currency,cents,today().isoformat()))
     await show_goal(message,cur.lastrowid)
     return True
 
@@ -1246,12 +1204,13 @@ async def move_goal(message,goal_id,value,negative=False):
     r=goal_row(goal_id)
     if not r:
         await message.reply_text('Цель не найдена.');return False
-    try:
-        raw=value.strip().upper()
-        if raw.endswith(' '+r['currency']):raw=raw[:-(len(r['currency'])+1)]
-        cents=positive_cents(raw)
-    except (ValueError,InvalidOperation):
+    parsed=parse_money(value,r['currency'])
+    if not parsed or parsed[2] or value.lstrip().startswith('-'):
         await message.reply_text(f"Напиши положительную сумму в {r['currency']}: 50 или 50,25. /cancel — отменить.");return False
+    amount,currency,_=parsed
+    if currency!=r['currency']:
+        await message.reply_text(f"Эта цель в {r['currency']}. Сумму в {currency} не конвертирую. Выбери цель в {currency} или укажи сумму в {r['currency']}.");return False
+    cents=abs(amount)
     if negative and cents>r['saved']:
         await message.reply_text('Нельзя снять больше, чем уже отмечено для цели.');return False
     available=balance_values(r['currency'])[2]
@@ -1360,16 +1319,16 @@ async def add_trip_expense(message,trip_id,raw,chosen_category=None):
     else:day=today()
     if day>today():
         await message.reply_text('Дата расхода не может быть в будущем.');return False
-    entry=parse_entry(raw,trip['currency'])
-    if not entry and chosen_category:
-        entry=parse_entry(raw+' '+chosen_category,trip['currency'])
+    entry=parse_entry(raw,default_currency() or 'EUR')
+    if chosen_category and entry and entry[2]=='другое':
+        entry=(entry[0],entry[1],chosen_category)
     if not entry:
         await message.reply_text('Напиши сумму с описанием: 1,50 EUR автобус. Для прошлой даты: 15 сентября 2 EUR автобус. /cancel — отменить.');return False
     cents,currency,description=entry
     category=chosen_category or trip_category_for(description)
     with conn() as c:
         cur=c.execute("INSERT INTO operations(user_id,source,day,amount_cents,currency,description,category,trip_id,trip_category) VALUES(?,'cash',?,?,?,?,'путешествия',?,?)",(owner(),day.isoformat(),-abs(cents),currency,description,trip_id,category))
-    await message.reply_text(f"Поездка «{trip['name']}»: записано #{cur.lastrowid} · {day} · {abs(cents)/100:.2f} {currency} · {category}. Этот расход уменьшил баланс и учтён в общем отчёте один раз. Можно написать следующий расход; /cancel — выйти из ввода. /delete {cur.lastrowid} — удалить.")
+    await message.reply_text(f"Поездка «{trip['name']}»: записано #{cur.lastrowid} · {day} · {abs(cents)/100:.2f} {currency} · {category}. {balance_receipt(currency)}. Этот расход учтён в общем отчёте один раз. Можно написать следующий расход; /cancel — выйти из ввода. /delete {cur.lastrowid} — удалить.")
     return True
 
 
@@ -1438,13 +1397,10 @@ async def update_trip_budget(message,trip_id,raw):
     trip=trip_row(trip_id)
     if not trip:
         await message.reply_text('Поездка не найдена.');return False
-    parts=raw.strip().split()
-    if len(parts) not in (1,2) or (len(parts)==2 and parts[1].upper()!=trip['currency']):
-        await message.reply_text(f"Напиши сумму в {trip['currency']}, например 500 или 500 {trip['currency']}. Напиши 0, чтобы снять лимит.");return False
-    try:
-        amount=None if Decimal(parts[0].replace(',','.'))==0 else positive_cents(parts[0])
-    except (ValueError,InvalidOperation):
-        await message.reply_text('Лимит должен быть положительным числом, максимум два знака после запятой.');return False
+    parsed=parse_money(raw,trip['currency'],allow_zero=True)
+    if not parsed or parsed[2] or parsed[1]!=trip['currency'] or raw.lstrip().startswith('-'):
+        await message.reply_text(f"Напиши сумму в {trip['currency']}, например 500. Ноль снимает лимит. Другие валюты автоматически не пересчитываются.");return False
+    amount=abs(parsed[0]) or None
     with conn() as c:c.execute('UPDATE trips SET budget_cents=? WHERE user_id=? AND id=?',(amount,owner(),trip_id))
     await show_trip(message,trip_id)
     return True
